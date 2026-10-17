@@ -1,0 +1,10 @@
+{
+    "name": "software-design-diagrams",
+    "owner": {"name": "Mohammad Otoofi"},
+    "plugins": [{
+      "name": "software-design-diagrams-pro",
+      "source": "./",
+      "description": "<copied from plugin.json>"
+    }]
+  }
+  
