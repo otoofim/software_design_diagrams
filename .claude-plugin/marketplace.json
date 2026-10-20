@@ -1,0 +1,9 @@
+{
+  "name": "software-design-diagrams",
+  "owner": {"name": "Mohammad Otoofi"},
+  "plugins": [{
+    "name": "software-design-diagrams-pro",
+    "source": "./",
+    "description": "Produces professional software-engineering diagrams as interactive, self-contained HTML pages with clickable components."
+  }]
+}
