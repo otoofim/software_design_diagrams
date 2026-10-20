@@ -21,11 +21,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from layout_lib import (Page, colors, esc, fit_box, lane_layout, layered_layout,  # noqa: E402
                         merge_style, nested_layout, slug, text_width)
+from layout_check import check_layout  # noqa: E402
 from emit_html import write_html, write_index  # noqa: E402
 
 MARGIN = 40
@@ -117,7 +119,7 @@ def render_flowchart(d, page):
             lane_of[str(n["id"])] = ln
         rel, lane_x, lane_w, total_h = lane_layout(
             [str(n["id"]) for n in nodes], sizes, pairs, lane_of, lane_names,
-            rank_gap=70 if has_labels else 50)
+            rank_gap=_label_gap([e.get("label") for e in edges], "TB", 70 if has_labels else 50))
         pool_w = sum(lane_w.values())
         pool = page.vertex(page.uid("pool"), f"<b>{esc(d.get('name', 'Process'))}</b>",
                            "swimlane;childLayout=stackLayout;resizeParent=1;resizeParentMax=0;"
@@ -142,7 +144,8 @@ def render_flowchart(d, page):
                                              "description": n.get("description"), "kind": kind})
     else:
         pos, _ = layered_layout(sizes, pairs, direction, node_gap=50,
-                                rank_gap=80 if has_labels else 60)
+                                rank_gap=_label_gap([e.get("label") for e in edges], direction,
+                                                    80 if has_labels else 60))
         for n in nodes:
             nid = str(n["id"])
             kind = n.get("kind", "process") if n.get("kind", "process") in FLOW_SHAPES else "process"
@@ -330,8 +333,11 @@ def render_state(d, page):
     trans = [t for t in d.get("transitions", [])
              if _check_ref(t.get("from"), flat, "transition", page) and _check_ref(t.get("to"), flat, "transition", page)]
     pairs = [(str(t["from"]), str(t["to"])) for t in trans]
+    tlabels = [" ".join(filter(None, (str(t.get("event", "")), t.get("guard") and f"[{t['guard']}]",
+                                      t.get("action") and f"/ {t['action']}"))) for t in trans]
     rel, sizes, _ = nested_layout(roots, children, sizes, pairs, d.get("direction", "LR"),
-                                  pad=30, header=header, min_width=minw, node_gap=50, rank_gap=110)
+                                  pad=30, header=header, min_width=minw, node_gap=50,
+                                  rank_gap=_label_gap(tlabels, d.get("direction", "LR"), 110))
     cell = {}
 
     def place(items, parent_cell):
@@ -408,6 +414,7 @@ def render_er(d, page):
                 "portConstraint=eastwest;rotatable=0;whiteSpace=wrap;html=1;",
                 0, 30 + i * ROW_H, w, ROW_H, parent=cid)
             row_cell[(name, a["name"])] = rid
+    er_edges, ports = [], []
     for i, r in enumerate(rels):
         f, t = str(r["from"]), str(r["to"])
         card = str(r.get("cardinality", "")).lower().replace(" ", "")
@@ -424,17 +431,45 @@ def render_er(d, page):
                 page.warnings.append(f"relationship {f}->{t}: cardinality '{card}' should look like '1:N'")
                 fc, tc = "1", "0..*"
         fc, tc = str(fc or "1"), str(tc or "0..*")
-        src = row_cell.get((f, r.get("from_field")), cell[f])
-        dst = row_cell.get((t, r.get("to_field")), cell[t])
-        field_level = src != cell[f] or dst != cell[t]
-        st = ("edgeStyle=entityRelationEdgeStyle;fontSize=12;html=1;rounded=0;"
-              if field_level else EDGE.replace("rounded=1", "rounded=0"))
+        src, dst = cell[f], cell[t]
+        st = EDGE.replace("rounded=1", "rounded=0")
         st += (f"startArrow={ER_ENDS.get(fc.lower(), 'ERmandOne')};"
                f"endArrow={ER_ENDS.get(tc.lower(), 'ERzeroToMany')};startFill=0;endFill=0;"
                "startSize=12;endSize=12;labelBackgroundColor=default;")
         if r.get("identifying") is False or r.get("dashed"):
             st += "dashed=1;"
-        page.edge(page.uid(f"rel{i}"), esc(r.get("label", "")), merge_style(st, r.get("style")), src, dst)
+        ports.append(_er_ports(page, src, dst, row_cell.get((f, r.get("from_field"))),
+                               row_cell.get((t, r.get("to_field")))))
+        er_edges.append((page.uid(f"rel{i}"), esc(r.get("label", "")),
+                         merge_style(st, r.get("style")), src, dst))
+    # field-level relationships leave and enter at their column's row, from the
+    # table side facing the other table; every route avoids the other tables
+    routes = page.route_edges([(e[3], e[4]) for e in er_edges],
+                              fixed={i: p for i, p in enumerate(ports) if p})
+    for (eid, lbl, st, src, dst), (pts, anchor) in zip(er_edges, routes):
+        page.edge(eid, lbl, merge_style(st, anchor) if anchor else st, src, dst, points=pts)
+
+
+def _er_ports(page, src, dst, srow, drow):
+    """Fixed (side, fraction) ports for a relationship drawn between two
+    columns, or None for a table-level relationship."""
+    if not srow and not drow:
+        return None
+    sb, db = page.abs[src], page.abs[dst]
+    scx, dcx = sb[0] + sb[2] / 2, db[0] + db[2] / 2
+    if sb[0] + sb[2] <= db[0]:
+        sides = ("right", "left")
+    elif db[0] + db[2] <= sb[0]:
+        sides = ("left", "right")
+    else:  # stacked: loop round the side they share
+        sides = ("right", "right") if scx <= dcx else ("left", "left")
+
+    def frac(table, row):
+        if not row:
+            return 0.5
+        tb, rb = page.abs[table], page.abs[row]
+        return (rb[1] + rb[3] / 2 - tb[1]) / tb[3]
+    return (sides[0], frac(src, srow)), (sides[1], frac(dst, drow))
 
 
 def _norm_attr(a):
@@ -828,6 +863,9 @@ def _nested_common(d, page, mode):
     iface_nodes = {}
     extra_edges = []
     if mode == "component":
+        # lollipops are clickable too: their job comes from the diagram-level
+        # {"interfaces": {"Name": "description"}} map
+        iface_desc = d.get("interfaces") or {}
         for eid, el in list(flat.items()):
             for iname in el.get("provides", []):
                 iid = f"if_{slug(iname)}"
@@ -835,14 +873,16 @@ def _nested_common(d, page, mode):
                     iface_nodes[iid] = iname
                     parent = next((p for p, ks in children.items() if eid in ks), None)
                     (children.setdefault(parent, []) if parent else roots).append(iid)
-                    flat[iid] = {"id": iid, "label": iname, "kind": "interface"}
+                    flat[iid] = {"id": iid, "label": iname, "kind": "interface",
+                                 "description": iface_desc.get(iname)}
                 extra_edges.append((eid, iid, "provides"))
             for iname in el.get("requires", []):
                 iid = f"if_{slug(iname)}"
                 if iid not in iface_nodes:
                     iface_nodes[iid] = iname
                     roots.append(iid)
-                    flat[iid] = {"id": iid, "label": iname, "kind": "interface"}
+                    flat[iid] = {"id": iid, "label": iname, "kind": "interface",
+                                 "description": iface_desc.get(iname)}
                 extra_edges.append((eid, iid, "requires"))
 
     sizes, header, minw, style, label = {}, {}, {}, {}, {}
@@ -939,7 +979,9 @@ def _nested_common(d, page, mode):
     default_dir = "TB" if mode == "component" else "LR"
     rel, sizes, _ = nested_layout(roots, children, sizes, pairs, d.get("direction", default_dir),
                                   pad=40, header=header, min_width=minw, node_gap=50,
-                                  rank_gap=110 if mode != "component" else 90)
+                                  rank_gap=_label_gap([c.get("label") for c in conns],
+                                                      d.get("direction", default_dir),
+                                                      110 if mode != "component" else 90))
     cell = {}
 
     def place(items, parent_cell):
@@ -963,6 +1005,8 @@ def _nested_common(d, page, mode):
                 place(children[eid], cell[eid])
     place(roots, "1")
 
+    routes = page.route_edges([(cell[str(c["from"])], cell[str(c["to"])]) for c in conns] +
+                              [(cell[a], cell[b]) for a, b, _ in extra_edges])
     for i, c in enumerate(conns):
         kind = c.get("kind", "sync")
         lbl = c.get("label", "")
@@ -985,11 +1029,11 @@ def _nested_common(d, page, mode):
         if c.get("bidirectional"):
             st += "startArrow=block;startFill=1;"
         src, tgt = cell[str(c["from"])], cell[str(c["to"])]
-        points, anchor = page.route_edge(src, tgt)
+        points, anchor = routes[i]
         page.edge(page.uid(f"c{i}"), esc(lbl), merge_style(merge_style(st, anchor), c.get("style")),
                   src, tgt, points=points)
     for i, (a, b, how) in enumerate(extra_edges):
-        pts, anchor = page.route_edge(cell[a], cell[b])
+        pts, anchor = routes[len(conns) + i]
         if how == "provides":
             page.edge(page.uid(f"prov{i}"), "", merge_style("endArrow=none;html=1;rounded=0;", anchor),
                       cell[a], cell[b], points=pts)
@@ -1338,7 +1382,49 @@ def _page_warnings(page):
             has_pts = c.source_point is not None or c.target_point is not None
             if (c.source is None or c.target is None) and not has_pts:
                 probs.append(f"edge '{c.id}' is dangling (no source/target or points)")
+    # every clickable box should explain itself when picked, in terms of its job
+    for m in page.meta.values():
+        sid = m.get("spec_id") or m.get("title")
+        desc = str(m.get("description") or "").strip()
+        if not desc:
+            probs.append(f"missing description: '{sid}'")
+            continue
+        for issue in _description_issues(desc, str(m.get("title") or "")):
+            probs.append(f"weak description: '{sid}': {issue}")
     return probs
+
+
+#: a description longer than this stops being a quick answer to "what is this
+#: box for?" -- the rest belongs in the diagram's key_points.
+_DESC_MAX_CHARS = 320
+
+
+def _description_issues(desc, title):
+    """Heuristic lint for descriptions that explain *how the code is wired*
+    instead of *what job the component does*. Returns human-readable issues;
+    an empty list means the description passes."""
+    issues = []
+    code_spans = re.findall(r"`([^`]+)`", desc)
+    code_chars = sum(len(c) for c in code_spans)
+    prose = re.sub(r"`[^`]+`", "", desc)
+    if desc.startswith("`"):
+        issues.append("starts with a code name -- start with the job the component does, "
+                      "in plain words (code names belong in `technology`)")
+    elif code_spans and code_chars > 0.35 * len(desc):
+        issues.append("mostly code names -- say the job in plain words; move identifiers "
+                      "to `technology` or key_points")
+    calls = re.findall(r"\b[A-Za-z_][\w.]*\(\)", prose) + \
+        [c for c in code_spans if re.search(r"\w\(", c)]
+    if len(calls) >= 3:
+        issues.append(f"walks through {len(calls)} function calls -- that is implementation "
+                      "detail; describe the outcome instead")
+    if len(desc) > _DESC_MAX_CHARS:
+        issues.append(f"{len(desc)} characters -- keep it to the job plus one 'why' sentence "
+                      f"(<= {_DESC_MAX_CHARS}); move the rest to key_points")
+    norm = lambda t: re.sub(r"[^a-z0-9]+", " ", t.lower()).strip()
+    if title and norm(desc).rstrip(" .") in (norm(title), norm(title) + "s"):
+        issues.append("only repeats the label -- say what it does")
+    return issues
 
 
 #: every key a diagram type may use to hold its drillable elements. A single
@@ -1363,6 +1449,59 @@ def _iter_elements(d):
             yield from walk(items)
 
 
+def _intro_of(d):
+    """Page-level explanation fields of a diagram spec (all optional)."""
+    keys = ("summary", "how_to_read", "steps", "key_points", "glossary")
+    intro = {k: d[k] for k in keys if d.get(k)}
+    return intro or None
+
+
+def _canonical_type(t):
+    """Diagram type with aliases folded (erd→er, use_case→usecase, ...), so
+    two specs can be compared for "same kind of diagram"."""
+    t = str(t or "").lower()
+    return {"erd": "er", "use_case": "usecase", "state_machine": "state"}.get(t, t)
+
+
+#: canonical type -> the suffix shown at the end of a diagram's title
+_TYPE_TITLES = {
+    "sequence": "Sequence diagram", "flowchart": "Flowchart diagram",
+    "er": "ER diagram", "class": "Class diagram",
+    "architecture": "Architecture diagram", "usecase": "Use case diagram",
+    "activity": "Activity diagram", "state": "State diagram",
+    "component": "Component diagram", "deployment": "Deployment diagram",
+}
+
+
+def _typed_title(name, dtype):
+    """`name` ending with its diagram type ("… — Architecture diagram"), so
+    every page title and index entry says what kind of diagram it is."""
+    suffix = _TYPE_TITLES.get(_canonical_type(dtype))
+    if not suffix or name.lower().endswith(suffix.lower()):
+        return name
+    return f"{name} — {suffix}"
+
+
+def _label_gap(labels, direction, base, cap=320):
+    """Gap between ranks big enough that an edge label fits between the
+    two boxes it joins instead of sitting on top of one of them. Left-right
+    layouts need the label's width; top-down ones its height."""
+    texts = [str(t) for t in labels if t]
+    if not texts:
+        return base
+    if direction in ("LR", "RL"):
+        need = max(text_width(t, 11) for t in texts) + 40
+    else:
+        need = 16 * max(t.count("<br>") + t.count("\n") + 1 for t in texts) + 44
+    return max(base, min(cap, need))
+
+
+#: diagram types whose renderers create edges without a route; they are routed
+#: in one pass once every box is placed. (Nested types route as they render;
+#: sequence messages are horizontal by construction.)
+_ROUTED_LATE = {"flowchart", "activity", "state", "class", "usecase"}
+
+
 def _render_detail(detail, parent_label):
     """Render a `detail` sub-spec (a full diagram spec for one component's
     internals) into a laid-out Page. Returns (title, Page) or None on error."""
@@ -1371,29 +1510,63 @@ def _render_detail(detail, parent_label):
     dtype = str(detail.get("type", "")).lower()
     if dtype not in RENDERERS:
         return None
-    title = detail.get("name") or f"{parent_label} — detail"
+    title = _typed_title(detail.get("name") or f"{parent_label} — detail", dtype)
     page = Page(title)
     try:
         RENDERERS[dtype](detail, page)
     except SpecError:
         return None
+    if dtype in _ROUTED_LATE:
+        page.route_unrouted()
     page.spread_parallel_edges()
+    page.intro = _intro_of(detail)
     return title, page
 
 
-def _collect_details(d):
-    """Map each element's spec id to its rendered detail Page, for every element
-    in diagram `d` that carries a `detail` sub-spec."""
+def _collect_details(d, prefix="", errors=None):
+    """Map each element's layer key to its rendered detail Page, for every element
+    in diagram `d` that carries a `detail` sub-spec — recursively, so a detail
+    diagram's own elements may carry a further `detail`. Top-level keys are the
+    element's spec id; nested keys are slash-joined paths ("parent/child").
+    Insertion order is pre-order (a parent layer precedes its children), which
+    the HTML emitter relies on for stacking.
+
+    A drill-down must be the same diagram type as the diagram it sits in (an
+    architecture box zooms into an architecture diagram, a flowchart node into
+    a flowchart, ...). A mismatched or unrenderable `detail` is skipped and
+    reported in `errors` as a hard error."""
     details = {}
+    parent_type = _canonical_type(d.get("type"))
     for el in _iter_elements(d):
         if el.get("detail"):
             sid = str(el.get("id") or el.get("name") or "")
             if not sid:
                 continue
-            rendered = _render_detail(el["detail"], el.get("label", sid))
+            key = f"{prefix}{sid}"
+            det = el["detail"]
+            dtype = _canonical_type(det.get("type") if isinstance(det, dict) else None)
+            if dtype != parent_type:
+                if errors is not None:
+                    errors.append(f"detail '{key}' is a '{dtype or '?'}' diagram inside a "
+                                  f"'{parent_type}' diagram — a drill-down must be the "
+                                  f"same type as its parent")
+                continue
+            rendered = _render_detail(det, el.get("label", sid))
             if rendered:
-                details[sid] = rendered
+                details[key] = rendered
+                details.update(_collect_details(det, prefix=key + "/", errors=errors))
+            elif errors is not None:
+                errors.append(f"detail '{key}' could not be rendered (check its spec)")
     return details
+
+
+def _diagram_fname(n, name, dtype):
+    """File name for diagram #n. The type is part of the name when it ends with
+    "<Type> diagram"; otherwise append it so every file says what kind it is."""
+    s = slug(name)
+    if s.endswith("-diagram") or s.endswith(f"-{dtype}"):
+        return f"{n:02d}-{s}.html"
+    return f"{n:02d}-{s}-{dtype}-diagram.html"
 
 
 def build(spec, out_dir, combined=None, only=None):
@@ -1405,37 +1578,51 @@ def build(spec, out_dir, combined=None, only=None):
     for n, d in enumerate(diagrams, 1):
         dtype = str(d.get("type", "")).lower()
         if only and dtype not in only:
+            # not re-rendered this run, but still listed so the index always
+            # covers the whole spec (its file is left as previously written)
+            sname = _typed_title(d.get("name") or dtype.title(), dtype)
+            entries.append((sname, _diagram_fname(n, sname, dtype), d.get("index_blurb")))
             continue
         if dtype not in RENDERERS:
             problems.append(f"diagram #{n}: unknown type '{dtype}' (valid: {', '.join(sorted(RENDERERS))})")
             continue
-        name = d.get("name") or dtype.title()
+        name = _typed_title(d.get("name") or dtype.title(), dtype)
         page = Page(name)
         try:
             RENDERERS[dtype](d, page)
         except SpecError as e:
             problems.append(f"{dtype} '{name}': {e}")
             continue
+        if dtype in _ROUTED_LATE:
+            page.route_unrouted()
         page.spread_parallel_edges()
-        fname = f"{n:02d}-{dtype}-{slug(name)}.html"
+        page.intro = _intro_of(d)
+        fname = _diagram_fname(n, name, dtype)
         path = os.path.join(out_dir, fname)
-        details = _collect_details(d)
+        detail_errors = []
+        details = _collect_details(d, errors=detail_errors)
+        problems.extend(f"{dtype} '{name}': {e}" for e in detail_errors)
         write_html(page, path, title=name, details=details, index_href=index_href)
-        for w in _page_warnings(page):
+        for w in _page_warnings(page) + check_layout(page, dtype):
             problems.append(f"WARNING {fname}: {w}")
         for sid, (_t, dpage) in details.items():
-            for w in _page_warnings(dpage):
+            for w in _page_warnings(dpage) + check_layout(dpage, dtype):
                 problems.append(f"WARNING {fname} (detail {sid}): {w}")
         pages.append(page)
         written.append(path)
-        entries.append((name, fname))
+        entries.append((name, fname, d.get("index_blurb")))
         for w in page.warnings:
             problems.append(f"WARNING {fname}: {w}")
-    if pages:
+    if entries:
         title = spec.get("title") if isinstance(spec, dict) else None
-        write_index(entries, index_path, title=title or "Diagrams")
+        write_index(entries, index_path, title=title or "Diagrams",
+                    intro=_intro_of(spec) if isinstance(spec, dict) else None)
         written.append(index_path)
     return written, problems
+
+
+_LAYOUT_PROBLEM = re.compile(r": (connectors cross|connectors share a line|connector '.*' runs "
+                             r"through|labels overlap|label '.*' \(.*\) covers)")
 
 
 def main():
@@ -1445,6 +1632,9 @@ def main():
     ap.add_argument("--index", dest="combined",
                     help="path for the index page (defaults to OUT/index.html)")
     ap.add_argument("--only", help="comma-separated diagram types to render")
+    ap.add_argument("--draft", action="store_true",
+                    help="exit 0 even if some elements have no description "
+                         "(for early iterations; a finished set must not need this)")
     args = ap.parse_args()
     with open(args.spec, encoding="utf-8") as fh:
         spec = json.load(fh)
@@ -1454,7 +1644,23 @@ def main():
         print(f"wrote {p}")
     for p in problems:
         print(p, file=sys.stderr)
-    if any(not p.startswith("WARNING") for p in problems):
+    hard = [p for p in problems if not p.startswith("WARNING")]
+    missing = [p for p in problems if "missing description:" in p]
+    weak = [p for p in problems if "weak description:" in p]
+    layout = [p for p in problems if _LAYOUT_PROBLEM.search(p)]
+    if layout:
+        print(f"\n{len(layout)} misleading connector(s) or label(s): crossings, lines through "
+              "boxes, shared lines or covered labels. The router already avoided what it "
+              "could; fix the rest in the spec (see SKILL.md step 6).", file=sys.stderr)
+    if missing or weak:
+        print(f"\n{len(missing)} element(s) without a description, {len(weak)} weak "
+              "description(s). Every clickable element needs a description that says, "
+              "in plain words, what job it does (see references/spec-format.md).",
+              file=sys.stderr)
+    if hard or (missing and not args.draft):
+        if missing and not args.draft:
+            print("Failing because descriptions are missing; pass --draft to allow "
+                  "this while iterating.", file=sys.stderr)
         sys.exit(1)
 
 

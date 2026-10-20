@@ -179,20 +179,60 @@ def _path_clear(points, obstacles, margin):
     return True
 
 
-def _anchor_style(exit_side, entry_side):
+def _anchor_style(exit_side, entry_side, exit_frac=0.5, entry_frac=0.5):
     """exitX/exitY/entryX/entryY style fragment that pins an edge's endpoints
     to the exact side-midpoints `route_orthogonal` used to build its path. The
     HTML emitter reads these to attach the connector to the precise border
     point the route assumed, so the first/last segment stays axis-aligned
     instead of cutting diagonally from the box centre."""
-    coord = {"left": (0, 0.5), "right": (1, 0.5), "top": (0.5, 0), "bottom": (0.5, 1)}
-    ex, ey = coord[exit_side]
-    nx, ny = coord[entry_side]
+    def coord(side, f):
+        return {"left": (0, f), "right": (1, f), "top": (f, 0), "bottom": (f, 1)}[side]
+    ex, ey = coord(exit_side, round(exit_frac, 4))
+    nx, ny = coord(entry_side, round(entry_frac, 4))
     return (f"exitX={ex};exitY={ey};exitDx=0;exitDy=0;"
             f"entryX={nx};entryY={ny};entryDx=0;entryDy=0;")
 
 
-def route_orthogonal(sbox, tbox, obstacles, margin=14):
+def _cross_count(path, existing):
+    """How many already-routed segments `path` crosses, and how far it runs on
+    top of one (collinear overlap). Both make a diagram misleading: a reader
+    can't tell which line continues where."""
+    crosses, overlap = 0, 0.0
+    for (ax, ay), (bx, by) in zip(path, path[1:]):
+        h = ay == by
+        for (cx, cy), (dx, dy) in existing:
+            if (cy == dy) == h:
+                if h and abs(ay - cy) < 4:
+                    lo, hi = max(min(ax, bx), min(cx, dx)), min(max(ax, bx), max(cx, dx))
+                    overlap += max(0.0, hi - lo)
+                elif not h and abs(ax - cx) < 4:
+                    lo, hi = max(min(ay, by), min(cy, dy)), min(max(ay, by), max(cy, dy))
+                    overlap += max(0.0, hi - lo)
+                continue
+            if h:
+                x, y = cx, ay
+                if min(ax, bx) < x < max(ax, bx) and min(cy, dy) < y < max(cy, dy):
+                    crosses += 1
+            else:
+                x, y = ax, cy
+                if min(cx, dx) < x < max(cx, dx) and min(ay, by) < y < max(ay, by):
+                    crosses += 1
+    return crosses, overlap
+
+
+#: routing cost of one crossing / one px of shared line, in px of extra length
+CROSS_COST = 400
+OVERLAP_COST = 3
+
+
+def _path_cost(path, existing):
+    c, o = _cross_count(path, existing)
+    length = sum(abs(a[0] - b[0]) + abs(a[1] - b[1]) for a, b in zip(path, path[1:]))
+    return c * CROSS_COST + o * OVERLAP_COST + length + 40 * (len(path) - 2)
+
+
+def route_orthogonal(sbox, tbox, obstacles, margin=14, existing=None, ports=None,
+                     strict=False):
     """Orthogonal path from `sbox` to `tbox` (each `(x, y, w, h)`, absolute)
     that avoids every box in `obstacles`. Returns `(waypoints, anchor_style)`:
     `waypoints` is a list of intermediate `(x, y)` points for an edge's
@@ -214,11 +254,14 @@ def route_orthogonal(sbox, tbox, obstacles, margin=14):
     scx, scy = sx + sw / 2, sy + sh / 2
     tcx, tcy = tx + tw / 2, ty + th / 2
 
-    exit_side = _exit_side(sbox, (tcx, tcy))
-    entry_side = _exit_side(tbox, (scx, scy))
-    sp = _side_point(sbox, exit_side)
-    tp = _side_point(tbox, entry_side)
-    anchor = _anchor_style(exit_side, entry_side)
+    if ports:
+        (exit_side, ef), (entry_side, nf) = ports
+    else:
+        exit_side, ef = _exit_side(sbox, (tcx, tcy)), 0.5
+        entry_side, nf = _exit_side(tbox, (scx, scy)), 0.5
+    sp = _side_point(sbox, exit_side, ef)
+    tp = _side_point(tbox, entry_side, nf)
+    anchor = _anchor_style(exit_side, entry_side, ef, nf)
 
     candidates = []
     # straight line (only valid if both points share an axis)
@@ -243,14 +286,45 @@ def route_orthogonal(sbox, tbox, obstacles, margin=14):
         mid = (sp[1] + tp[1]) / 2
         candidates.append([sp, (sp[0], mid), (tp[0], mid), tp])
 
-    for path in candidates:
-        if _path_clear(path, obstacles, margin):
-            return path[1:-1], anchor
+    existing = existing or []
+    clear = [p for p in candidates if _path_clear(p, obstacles, margin)]
+    best = min(clear, key=lambda p: _path_cost(p, existing), default=None)
+    if best is not None and _cross_count(best, existing) == (0, 0.0):
+        return best[1:-1], anchor
+    # an elbow would cross or ride on an earlier connector (or is blocked):
+    # search the grid too, then keep whichever route misleads least
+    found = _grid_route(sp, tp, sbox, tbox, obstacles, margin, existing,
+                        (exit_side, entry_side), strict)
+    if found is not None and (best is None or
+                              _path_cost(found, existing) < _path_cost(best, existing)):
+        return found[1:-1], _anchor_for(found, sbox, tbox)
+    if best is not None:
+        return best[1:-1], anchor
+    return None, None
 
-    # fall back: visibility grid + Dijkstra, restricted to obstacles that
-    # actually sit in the neighbourhood of the two shapes (a global grid
-    # over the whole diagram would be needlessly slow and wouldn't route
-    # any differently for a far-off box that was never in the way).
+
+def _anchor_for(path, sbox, tbox):
+    """Anchor style for a route whose endpoints lie on the shapes' borders."""
+    def side(box, pt):
+        x, y, w, h = box
+        if abs(pt[0] - x) < 0.5:
+            return "left", (pt[1] - y) / max(h, 1)
+        if abs(pt[0] - x - w) < 0.5:
+            return "right", (pt[1] - y) / max(h, 1)
+        if abs(pt[1] - y) < 0.5:
+            return "top", (pt[0] - x) / max(w, 1)
+        return "bottom", (pt[0] - x) / max(w, 1)
+    (es, ef), (ns, nf) = side(sbox, path[0]), side(tbox, path[-1])
+    return _anchor_style(es, ns, ef, nf)
+
+
+def _grid_route(sp, tp, sbox, tbox, obstacles, margin, existing, sides=None, strict=False):
+    """Visibility-grid search from `sp` to `tp` around `obstacles`, also
+    trying every side of both shapes and charging for crossing or riding on
+    `existing` segments. Returns the full point list or None."""
+    sx, sy, sw, sh = sbox
+    tx, ty, tw, th = tbox
+
     pad = 260
     region = (min(sx, tx) - pad, min(sy, ty) - pad,
               max(sx + sw, tx + tw) + pad, max(sy + sh, ty + th) + pad)
@@ -260,89 +334,117 @@ def route_orthogonal(sbox, tbox, obstacles, margin=14):
         return not (x + w < region[0] or x > region[2] or y + h < region[1] or y > region[3])
 
     local_obs = [b for b in obstacles if in_region(b)]
-    if not local_obs:
-        # nothing nearby was actually blocking; the elbow candidates already
-        # covered every reasonable direct route, so give up gracefully
-        return None, None
+    order = ("left", "right", "top", "bottom")
+    out_dir = {"left": (-1, 0), "right": (1, 0), "top": (0, -1), "bottom": (0, 1)}
+    # the assigned port on its side, plus the midpoints of the other sides
+    starts = [(sp if sides and k == sides[0] else _side_point(sbox, k), k) for k in order]
+    goals = [(tp if sides and k == sides[1] else _side_point(tbox, k), k) for k in order]
+    # leave each shape straight out of the side, so the first and last
+    # segments are perpendicular to it
+    stub = {}
+    for pts in (starts, goals):
+        for p, k in pts:
+            dx, dy = out_dir[k]
+            stub[p] = (p[0] + dx * (margin + 2), p[1] + dy * (margin + 2))
+    if strict:  # the caller's ports are fixed (e.g. an ER row): no other side
+        starts = [(p, k) for p, k in starts if k == sides[0]]
+        goals = [(p, k) for p, k in goals if k == sides[1]]
+    starts = [p for p, _ in starts]
+    goals = [p for p, _ in goals]
 
-    xs = {sp[0], tp[0]}
-    ys = {sp[1], tp[1]}
-    for bx, by, bw, bh in local_obs:
+    xs = {p[0] for p in stub.values()} | {p[0] for p in starts + goals}
+    ys = {p[1] for p in stub.values()} | {p[1] for p in starts + goals}
+    for bx, by, bw, bh in local_obs + [sbox, tbox]:
         for x in (bx - margin - 1, bx + bw + margin + 1):
             xs.add(x)
         for y in (by - margin - 1, by + bh + margin + 1):
             ys.add(y)
-    xs = sorted(xs)
-    ys = sorted(ys)
-    if len(xs) * len(ys) > 4000:
-        return None, None  # pathological case; let the caller fall back
+    # channels halfway between neighbouring coordinates give parallel
+    # connectors somewhere to go besides on top of each other
+    for vals in (xs, ys):
+        srt = sorted(vals)
+        vals.update((a + b) / 2 for a, b in zip(srt, srt[1:]) if b - a > 2 * margin)
+    xs, ys = sorted(xs), sorted(ys)
+    if len(xs) * len(ys) > 6000:
+        return None
+    blockers = local_obs + [sbox, tbox]
 
-    def blocked_node(x, y):
-        return any(_seg_hits_box(x, y, x, y + 0.001, b, 0) or
-                   (b[0] - margin < x < b[0] + b[2] + margin and
-                    b[1] - margin < y < b[1] + b[3] + margin)
-                   for b in local_obs)
+    def seg_ok(x0, y0, x1, y1):
+        return not any(_seg_hits_box(x0, y0, x1, y1, b, margin if b not in (sbox, tbox) else 0)
+                       for b in blockers)
 
-    nodes = [(x, y) for x in xs for y in ys if not blocked_node(x, y)]
-    node_set = set(nodes)
-    if sp not in node_set:
-        nodes.append(sp)
-        node_set.add(sp)
-    if tp not in node_set:
-        nodes.append(tp)
-        node_set.add(tp)
+    def seg_cost(a, b):
+        c, o = _cross_count([a, b], existing)
+        return abs(a[0] - b[0]) + abs(a[1] - b[1]) + c * CROSS_COST + o * OVERLAP_COST
 
-    def neighbours(p):
-        x, y = p
-        for nx in xs:
-            if nx != x and not any(_seg_hits_box(x, y, nx, y, b, margin) for b in local_obs):
-                yield (nx, y), abs(nx - x)
-        for ny in ys:
-            if ny != y and not any(_seg_hits_box(x, y, x, ny, b, margin) for b in local_obs):
-                yield (x, ny), abs(ny - y)
-
-    # Dijkstra with a small turn penalty so paths prefer fewer bends
-    dist = {sp: 0.0}
-    prev = {}
-    prev_dir = {sp: None}
-    pq = [(0.0, sp)]
-    visited = set()
+    xi = {x: i for i, x in enumerate(xs)}
+    yi = {y: i for i, y in enumerate(ys)}
+    goal_of = {stub[g]: g for g in goals}
+    dist, prev, pq = {}, {}, []
+    for s0 in starts:
+        n = stub[s0]
+        if not seg_ok(*s0, *n):
+            continue
+        d0 = seg_cost(s0, n)
+        key = (n, "h" if s0[1] == n[1] else "v")
+        if d0 < dist.get(key, float("inf")):
+            dist[key], prev[key] = d0, (s0, None)
+            heapq.heappush(pq, (d0, key))
+    best_end, best_d = None, float("inf")
+    done = set()
     while pq:
-        d, p = heapq.heappop(pq)
-        if p in visited:
+        d, key = heapq.heappop(pq)
+        if key in done or d >= best_d:
             continue
-        visited.add(p)
-        if p == tp:
-            break
-        for np_, cost in neighbours(p):
-            if np_ not in node_set:
+        done.add(key)
+        p, dirn = key
+        if p in goal_of:
+            g = goal_of[p]
+            if seg_ok(*p, *g):
+                tot = d + seg_cost(p, g) + (40 if dirn != ("h" if p[1] == g[1] else "v") else 0)
+                if tot < best_d:
+                    best_d, best_end = tot, key
+        x, y = p
+        steps = []
+        if x in xi:
+            for j in (yi.get(y, -1) - 1, yi.get(y, -1) + 1):
+                if y in yi and 0 <= j < len(ys):
+                    steps.append(((x, ys[j]), "v"))
+        if y in yi:
+            for j in (xi.get(x, -1) - 1, xi.get(x, -1) + 1):
+                if x in xi and 0 <= j < len(xs):
+                    steps.append(((xs[j], y), "h"))
+        for q, nd_dir in steps:
+            if not seg_ok(x, y, q[0], q[1]):
                 continue
-            direction = "h" if np_[1] == p[1] else "v"
-            turn_penalty = 40 if (prev_dir.get(p) not in (None, direction)) else 0
-            nd = d + cost + turn_penalty
-            if nd < dist.get(np_, float("inf")):
-                dist[np_] = nd
-                prev[np_] = p
-                prev_dir[np_] = direction
-                heapq.heappush(pq, (nd, np_))
-    if tp not in dist:
-        return None, None
-    path = [tp]
-    p = tp
-    while p != sp:
-        p = prev[p]
-        path.append(p)
+            nd = d + seg_cost(p, q) + (40 if nd_dir != dirn else 0)
+            nk = (q, nd_dir)
+            if nd < dist.get(nk, float("inf")):
+                dist[nk], prev[nk] = nd, (p, key)
+                heapq.heappush(pq, (nd, nk))
+    if best_end is None:
+        return None
+    path = [goal_of[best_end[0]]]
+    key = best_end
+    while key is not None:
+        p, pk = prev[key]
+        path.append(key[0])
+        if pk is None:
+            path.append(p)
+        key = pk
     path.reverse()
-    # simplify collinear runs
-    simplified = [path[0]]
-    for p in path[1:-1]:
-        a, b = simplified[-1], p
-        nxt = path[path.index(p) + 1]
-        if (a[0] == b[0] == nxt[0]) or (a[1] == b[1] == nxt[1]):
+    out = [path[0]]
+    for i in range(1, len(path) - 1):
+        a, b, c = out[-1], path[i], path[i + 1]
+        if (a[0] == b[0] == c[0]) or (a[1] == b[1] == c[1]) or b == a:
             continue
-        simplified.append(p)
-    simplified.append(path[-1])
-    return simplified[1:-1], anchor
+        out.append(b)
+    out.append(path[-1])
+    return out
+
+
+def _centre_dist(a, b):
+    return abs(a[0] + a[2] / 2 - b[0] - b[2] / 2) + abs(a[1] + a[3] / 2 - b[1] - b[3] / 2)
 
 
 # --------------------------------------------------------------------------- page
@@ -399,6 +501,8 @@ class Page:
         # always show at least a name and type.
         self.meta: dict[str, dict] = {}
         self.edge_meta: dict[str, dict] = {}
+        # segments of connectors routed so far, so later ones steer around them
+        self.routed: list[tuple] = []
 
     # ids ---------------------------------------------------------------
     def uid(self, base: str) -> str:
@@ -480,7 +584,7 @@ class Page:
                 c.style = merge_style(c.style, add + "exitDx=0;exitDy=0;entryDx=0;entryDy=0;")
 
     # obstacle-avoiding routing -----------------------------------------
-    def route_edge(self, source, target, avoid_ids=None, margin=14):
+    def route_edge(self, source, target, avoid_ids=None, margin=14, ports=None, strict=False):
         """Compute an explicit orthogonal route from `source` to `target` that
         steers clear of every other placed shape, so the edge never gets
         drawn on top of an unrelated box. Returns `(points, style_extra)`:
@@ -509,7 +613,142 @@ class Page:
             if _box_contains(sbox, box) or _box_contains(tbox, box):
                 continue  # shape nested inside source/target
             obstacles.append(box)
-        return route_orthogonal(sbox, tbox, obstacles, margin=margin)
+        pts, anchor = route_orthogonal(sbox, tbox, obstacles, margin=margin,
+                                       existing=self.routed, ports=ports, strict=strict)
+        if pts is not None:
+            st = dict(parse_style(anchor))
+            a = (sbox[0] + sbox[2] * float(st["exitX"]), sbox[1] + sbox[3] * float(st["exitY"]))
+            b = (tbox[0] + tbox[2] * float(st["entryX"]), tbox[1] + tbox[3] * float(st["entryY"]))
+            full = [a, *pts, b]
+            self.routed.extend(zip(full, full[1:]))
+        return pts, anchor
+
+    def crossable_containers(self):
+        """Containers whose job is to group other diagram elements (lanes,
+        pools, composite states, system boundaries, packages). Connectors may
+        cross them; only the elements inside are obstacles. A class box or ER
+        table also holds child cells (its rows), but those aren't elements, so
+        the box itself stays solid."""
+        boxes = [(c.id, self.abs[c.id]) for c in self.cells
+                 if c.is_vertex and not c.relative and c.id in self.abs]
+        return {cid for cid, b in boxes
+                if any(o != cid and o in self.meta and _box_contains(b, ob) for o, ob in boxes)}
+
+    def route_unrouted(self, margin=14):
+        """Route every box-to-box connector that has no route yet (flowchart,
+        activity, state, class and use-case edges are created unrouted), so
+        none is drawn as a straight line through another box or across
+        another connector."""
+        todo = [c for c in self.cells
+                if c.is_edge and c.source and c.target and c.source != c.target
+                and not c.points and "exitX" not in c.style
+                and c.source in self.abs and c.target in self.abs]
+        if not todo:
+            return
+        centred = {c.id for c in self.cells if c.is_vertex and any(
+            k in c.style for k in ("rhombus", "ellipse", "umlActor", "startState", "endState"))}
+        routes = self.route_edges([(c.source, c.target) for c in todo], margin,
+                                  centred=centred, avoid=self.crossable_containers())
+        for c, (pts, anchor) in zip(todo, routes):
+            if pts is not None:
+                c.points = pts
+                c.style = merge_style(c.style, anchor)
+
+    def route_edges(self, pairs, margin=14, centred=(), fixed=None, avoid=()):
+        """Route many connectors at once. Where several connectors meet the
+        same side of a shape, their attachment points are spread along that
+        side in the order of the shapes at their other ends, so they fan out
+        without crossing each other or sharing a line. Shapes in `centred`
+        (diamonds, circles, actors) keep every attachment at the side's
+        middle, where their outline actually is. `fixed` maps a pair's index
+        to `((exit side, frac), (entry side, frac))` for connectors whose ends
+        must sit at a given spot (e.g. an ER column row). Returns one
+        `(points, style_extra)` per pair, like `route_edge`."""
+        fixed = fixed or {}
+        ends = []
+        for s, t in pairs:
+            if s not in self.abs or t not in self.abs or s == t:
+                ends.append(None)
+                continue
+            sb, tb = self.abs[s], self.abs[t]
+            sc = (sb[0] + sb[2] / 2, sb[1] + sb[3] / 2)
+            tc = (tb[0] + tb[2] / 2, tb[1] + tb[3] / 2)
+            ends.append(((s, _exit_side(sb, tc), tc), (t, _exit_side(tb, sc), sc)))
+        # a diamond / circle has one attachment point per side: give each
+        # connector its own side so lines in and out never run together
+        by_side = defaultdict(list)
+        for i, e in enumerate(ends):
+            if e is not None and i not in fixed:
+                for j, (cid, side, other) in enumerate(e):
+                    if cid in centred:
+                        by_side[cid].append((i, j))
+        for cid, members in by_side.items():
+            box = self.abs[cid]
+            cx, cy = box[0] + box[2] / 2, box[1] + box[3] / 2
+            used = set()
+            # incoming ends keep their natural side first (the flow arrives
+            # from where it comes from), then outgoing ones pick what's left
+            for i, j in sorted(members, key=lambda m: -m[1]):
+                _c, side, other = ends[i][j]
+                if side in used:
+                    dx, dy = other[0] - cx, other[1] - cy
+                    pref = sorted(("left", "right", "top", "bottom"), key=lambda k: -(
+                        {"left": -dx, "right": dx, "top": -dy, "bottom": dy}[k]))
+                    side = next((k for k in pref if k not in used), side)
+                    e = list(ends[i])
+                    e[j] = (cid, side, other)
+                    ends[i] = tuple(e)
+                used.add(side)
+        slots = defaultdict(list)  # (cell, side) -> [(sort key, edge #, end #)]
+        frac = {}
+        for i, e in enumerate(ends):
+            if e is None:
+                continue
+            if i in fixed:
+                (ss, sf), (ts, tf) = fixed[i]
+                ends[i] = ((e[0][0], ss, e[0][2]), (e[1][0], ts, e[1][2]))
+                frac[(i, 0)], frac[(i, 1)] = sf, tf
+                continue
+            for j, (cid, side, other) in enumerate(e):
+                key = other[0] if side in ("top", "bottom") else other[1]
+                slots[(cid, side)].append((key, i, j))
+        for (cid, _side), members in slots.items():
+            members.sort()
+            n = len(members)
+            for k, (_key, i, j) in enumerate(members):
+                frac[(i, j)] = 0.5 if cid in centred else (k + 1) / (n + 1)
+        # short connectors first: they have the fewest ways around, so the
+        # long ones should be the ones that detour
+        order = sorted((i for i, e in enumerate(ends) if e is not None),
+                       key=lambda i: _centre_dist(self.abs[pairs[i][0]], self.abs[pairs[i][1]]))
+        out = [(None, None)] * len(pairs)
+        segs = {}
+        base = len(self.routed)
+        for i in order:
+            (s, ss, _), (t, ts, _) = ends[i]
+            n0 = len(self.routed)
+            out[i] = self.route_edge(s, t, margin=margin, avoid_ids=avoid, strict=i in fixed,
+                                     ports=((ss, frac[(i, 0)]), (ts, frac[(i, 1)])))
+            segs[i] = self.routed[n0:]
+        # second pass: rip up each connector and reroute it against all the
+        # others, so early connectors don't keep a route that forces crossings
+        for i in order:
+            if not segs[i]:
+                continue
+            others = [g for j in order if j != i for g in segs[j]]
+            before = _path_cost([segs[i][0][0]] + [b for _a, b in segs[i]], others)
+            del self.routed[base:]
+            self.routed.extend(others)
+            n0 = len(self.routed)
+            (s, ss, _), (t, ts, _) = ends[i]
+            cand = self.route_edge(s, t, margin=margin, avoid_ids=avoid, strict=i in fixed,
+                                   ports=((ss, frac[(i, 0)]), (ts, frac[(i, 1)])))
+            new = self.routed[n0:]
+            if new and _path_cost([new[0][0]] + [b for _a, b in new], others) < before:
+                out[i], segs[i] = cand, new
+            del self.routed[base:]
+            self.routed.extend(g for j in order for g in segs[j])
+        return out
 
     # output ------------------------------------------------------------
     def bounds(self):

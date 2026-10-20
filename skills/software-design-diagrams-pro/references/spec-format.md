@@ -37,42 +37,100 @@ draws it as clickable HTML/CSS boxes over an SVG connector layer.
 - `type` (required): `sequence`, `flowchart`, `er` (alias `erd`), `class`,
   `architecture`, `usecase` (alias `use_case`), `activity`, `state`
   (alias `state_machine`), `component`, `deployment`.
-- `name`: page title and part of the file name (`NN-<type>-<slug>.html`).
-- `description` (optional, on almost any node/element — participant, flowchart
-  node, ER entity, class, actor/use case, activity node, state, architecture/
-  component/deployment element): free-text prose shown in the interactive HTML
-  side panel when that component is clicked. Plain text; keep it to a sentence
-  or two. This is additive to the structured text each type already surfaces in
-  the panel (`technology`/`tech`, `stereotype`, class attributes/methods, state
-  `entry`/`do`/`exit`/`activities`, ER columns). On the reverse-engineering
-  path `analyze_code.py` auto-fills it from docstrings / doc-comments.
+- `name`: page title, ending with the diagram type — e.g. `"Checkout —
+  Sequence diagram"`, `"Order service — Architecture diagram"`. The generator
+  appends ` — <Type> diagram` to any title (top-level or drill-down) that
+  doesn't already end with it, so titles and the index always say what kind of
+  diagram each page is. The file name is `NN-<slug-of-name>.html`, so it ends
+  with `-<type>-diagram` too.
+- `description` (**required in practice** on every element a reader can click —
+  participant, flowchart node, ER entity, class, actor/use case, activity node,
+  state, architecture/component/deployment element *including groups*, and the
+  same inside every drill-down): free-text prose shown in the interactive HTML
+  side panel when that component is clicked. Write it for a newcomer as the
+  answer to *"what is this for?"*: **the job the component does, in plain
+  words**, then — only if it isn't obvious — one sentence on why it exists
+  (what would break without it). Keep it under ~320 characters.
+  **Not** how the code does it: class/function names, library calls, call
+  order, parameter and config names belong on the box's `technology` line or
+  in the diagram's `key_points`. This is additive to the structured text each
+  type already surfaces in the panel (`technology`/`tech`, `stereotype`, class
+  attributes/methods, state `entry`/`do`/`exit`/`activities`, ER columns).
+
+  Example — box `One LLM decision`, `technology: "Grouper.decide · DSPy"`:
+  - ✗ `` "`decide()` runs a DSPy `Predict` over `_GrouperSignature` with the JSONAdapter, so the reply is validated against `GrouperOutput`." ``
+  - ✓ `"Asks the AI once where the new turn belongs: does it continue one of the person's open problems, start a new one, or end one and start another?"`
+
+  The generator checks every clickable box at every drill-down depth:
+  `missing description: '<id>'` **fails the run** (exit 1; `--draft` allows
+  it while iterating), and `weak description: '<id>': <reason>` warns when the
+  text starts with a code name, is mostly identifiers, walks through function
+  calls, is too long, or only repeats the label. On the reverse-engineering
+  path `analyze_code.py` copies docstrings in and marks elements without one
+  with `_todo_description`; docstrings usually describe the implementation, so
+  rewrite them as jobs.
 - `detail` (optional, on **any** element of **any** diagram type — an
   architecture/component/deployment element, a flowchart/activity node, an ER
   entity, a class, a state, a sequence participant, a use case, or an actor): a
   **nested diagram spec** (its own `type` + whatever keys that type uses, e.g.
   `elements`/`connections`, or `nodes`/`edges` for a flowchart) describing that
-  element's internals — its process or subcomponents. The nested spec can be
-  **any of the ten diagram types**, regardless of the parent's type (e.g. zoom
-  from an ER entity into a `class` diagram, or from a sequence participant into
-  a `flowchart`). In the interactive HTML the element becomes **zoomable**
-  (marked with a ⤢): clicking it zooms in-place to render the detail diagram,
-  whose own boxes stay clickable for their descriptions; a "← Overview" control
-  zooms back out. The detail diagram is NOT added to the index — it lives inside
-  its parent element. Drill-down is one level deep: a detail diagram's own boxes
-  don't themselves carry a further zoom layer. Example:
+  element's internals — its process or subcomponents.
+  - **Same type as the parent.** A drill-down is a zoom, not a change of
+    viewpoint: an architecture box opens an `architecture` diagram, a flowchart
+    step opens a `flowchart`, a class opens a `class` diagram, and so on for
+    all ten types (aliases count as the same type: `erd`=`er`,
+    `use_case`=`usecase`, `state_machine`=`state`). A mismatched `detail` is a
+    **hard error**: that drill-down is skipped, the rest of the page is still
+    written, and the generator exits 1. When you want a *different* view of a
+    component (e.g. the flow inside an architecture box), make it its own
+    top-level diagram and say so in the box's `description`.
+  - **Recursive, until atomic.** A detail diagram's own elements may carry a
+    further `detail`, to any depth. Keep drilling until every leaf can no
+    longer be broken down into smaller components or steps. Each level gets its own zoom layer with a "← Back"
+    control (the first level shows "← Overview"), and every box at every
+    level stays clickable for its description.
+
+  In the interactive HTML the element becomes **zoomable** (marked with a ⤢).
+  Detail diagrams are NOT added to the index — they live inside their parent
+  element. Example (two levels):
 
   ```json
   {"id": "orders", "label": "Order Service", "kind": "service",
-   "detail": {"type": "component", "name": "Order Service — internals",
+   "description": "Owns the order lifecycle from checkout to fulfilment.",
+   "detail": {"type": "architecture", "name": "Order Service — internals",
      "elements": [
-       {"id": "ctrl", "label": "OrdersController", "description": "HTTP layer."},
-       {"id": "uc", "label": "CheckoutUseCase", "description": "Orchestration."}],
-     "connections": [{"from": "ctrl", "to": "uc"}]}}
+       {"id": "api", "label": "Orders API", "kind": "service",
+        "description": "HTTP entry point for checkout and order queries."},
+       {"id": "worker", "label": "Fulfilment worker", "kind": "worker",
+        "description": "Consumes paid orders and books shipments.",
+        "detail": {"type": "architecture", "name": "Fulfilment worker — internals",
+          "elements": [
+            {"id": "consumer", "label": "Queue consumer", "kind": "service",
+             "description": "Reads order.paid events."},
+            {"id": "carrier", "label": "Carrier client", "kind": "service",
+             "description": "Books the shipment with the carrier's API."}],
+          "connections": [{"from": "consumer", "to": "carrier"}]}}],
+     "connections": [{"from": "api", "to": "worker", "kind": "async"}]}}
   ```
 
-  It's most useful on the container-style overviews (architecture / component /
-  deployment), where a box stands for a big component with real internals — but
-  it works anywhere a single node is worth expanding.
+  What counts as atomic for each diagram type: see
+  `references/interview-guide.md` §2.1.
+- Page explanation fields (optional on any diagram, top-level or `detail`;
+  the spec's top level accepts the same keys for the index page). Rendered as a
+  collapsible "About this diagram" box above the canvas. For a
+  newcomer-oriented set, give every diagram at least `summary` and
+  `how_to_read`:
+  - `summary`: a string or list of paragraphs — what this diagram shows and
+    why a reader should care.
+  - `how_to_read`: list of bullets — what the shapes, colours, dashed lines
+    and ⤢ markers mean here.
+  - `steps`: numbered walkthrough, for flows.
+  - `key_points`: non-obvious facts ("the CLI calls the client directly;
+    the workers go through the adapter").
+  - `glossary`: `{term: definition}` for every domain term or acronym used.
+  - `index_blurb` (diagram only): one line shown under the diagram's link on
+    the index page — write these so the index reads as a reading path.
+  Inline `` `code` ``, `**bold**` and `*italic*` are rendered in these fields.
 - `direction`: `"TB"` (top→bottom) or `"LR"` (left→right) for every type that
   uses the layered layout (all except sequence and usecase). Defaults:
   flowchart/activity/state/class/component `TB`, er/architecture/deployment `LR`.
@@ -470,6 +528,10 @@ code or the user can't tell you how an object leaves a state, ask.
 ```json
 {
   "type": "component", "name": "Order service",
+  "interfaces": {
+    "OrdersAPI": "How clients place and look up orders.",
+    "PaymentsAPI": "How other services charge a customer."
+  },
   "elements": [
     {"id": "svc", "label": "Order Service", "kind": "subsystem", "children": [
       {"id": "ctrl", "label": "OrderController", "provides": ["OrdersAPI"]},
@@ -497,6 +559,9 @@ code or the user can't tell you how an object leaves a state, ask.
   `requires: ["Name"]` draws a dashed «use» dependency to that interface.
   Using the same interface name on both sides wires provider and consumer
   together through one shared lollipop.
+- Lollipops are clickable, so they need a description too: give the diagram
+  an `"interfaces": {"Name": "what this contract is for"}` map (same rules as
+  any `description`).
 - Connections default to dashed «use» dependencies; give a `label` to
   override (e.g. `"calls"`, `"publishes"`). Architecture leaf kinds
   (`database`, `queue`, …) are also accepted here.
@@ -550,6 +615,14 @@ code or the user can't tell you how an object leaves a state, ask.
 | `extend` drawn base → extension | Arrow points the wrong way | `from` = extending use case |
 | Composition `from` = part | Diamond on the wrong end | `from` = the whole |
 | Expecting spacing changes to fix an edge drawn through a box | Nothing improves — that's a routing problem, not a layout one | Change what connects to what / the nesting; see SKILL.md Step 6's two failure modes |
+| `detail` of a different type than its parent (e.g. an architecture box drilling into a flowchart) | Hard error, that drill-down is skipped, exit 1 | Make the drill-down the parent's type; put the other view in its own top-level diagram and point to it from the box's `description` |
+| Clickable element without `description` (incl. a component interface with no `interfaces` entry) | `WARNING … missing description` and the run exits 1 (unless `--draft`) | Add one: the job it does, in plain words |
+| Connectors cross, share a line, run through a box, or labels cover boxes | `WARNING … connectors cross` / `share a line` / `runs through` / `label … covers` and an "N misleading connector(s)" summary | The view holds too much: split into overview + drill-downs, group fan-in, drop obvious edges, reorder elements, shorten labels (SKILL.md step 6) |
+| Description explains the code instead of the job (starts with a function name, lists calls, mostly identifiers) | `WARNING … weak description`; readers are more confused after clicking than before | Lead with what the component does for the system; move identifiers to `technology` / `key_points` |
+| Adapter/wrapper drawn as a peer with the same `kind` as what it wraps, joined by an unlabeled edge | Readers see two redundant components ("why do we need both?") | `stereotype: "adapter"`, put *what it adapts* in `technology` (e.g. "framework X → InternalClient"), label the edge `delegates to` |
+| Two boxes with near-identical names and no visible difference | Readers can't tell their roles apart without clicking both | Make the role visible on the box itself (stereotype / technology line), not only in `description` |
+| `description` says what a component does but not why it exists | The reason for a non-obvious layer is lost | For every non-obvious layer, add one sentence on what would break without it |
+| Some callers go through a wrapper and others bypass it, but only one path is drawn | The asymmetry — often the most important fact — is invisible | Draw both edges; explain the difference in a description or `key_points` (or say it is historical/unrecorded) |
 
 The generator exits with status 1 if any diagram had a hard error; the
 other diagrams are still written.

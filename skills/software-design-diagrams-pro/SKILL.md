@@ -14,6 +14,42 @@ architect would ask (or read the code when it's available), then let the
 bundled scripts do the mechanical work of layout and rendering, which they do
 far more reliably than freehand coordinates ever would.
 
+## Who the diagrams are for
+
+Write every diagram set for a **newcomer**: an engineer who has never seen
+the project, opens `index.html`, and reads in order. By the end they should
+know what the project does, how data moves through it, where each piece lives
+in the code, and why the non-obvious pieces exist. Concretely:
+
+- **Every clickable element has a `description`** — at every drill-down
+  depth, groups and component-diagram interfaces included. The generator
+  **fails (exit 1)** when any is missing; `--draft` relaxes this only while
+  iterating.
+- **A description says the job the component does**, in plain words: what it
+  is *for*, not how its code is wired. One sentence for the job, plus at most
+  one sentence on why it exists or the behaviour a newcomer would trip over.
+  Class names, library calls, function signatures and config keys go in
+  `technology` (or the diagram's `key_points`), never as the description.
+  The generator flags descriptions that start with a code name, are mostly
+  identifiers, walk through function calls, run past ~320 characters, or
+  just repeat the label (`weak description` warnings). See "Writing
+  descriptions" below.
+- **Every diagram name ends with its type** ("Read path — Architecture
+  diagram", "Checkout — Sequence diagram"). The generator appends it if
+  missing, so titles, index entries and file names all say what kind of
+  diagram they are.
+- **Every diagram has a `summary` and `how_to_read`**, plus a `glossary`
+  when it uses domain terms; `index_blurb`s turn the index into a reading
+  path (context → overview → drill-downs → flows → data → deployment).
+- **Labels use plain words** a newcomer understands; exact code names go in
+  `technology`.
+- **No connector misleads.** Connectors don't cross each other, don't run
+  through a box that isn't one of their ends, don't share a stretch of line
+  with an unrelated connector, and their labels don't sit on boxes or on each
+  other. Each one makes a reader follow the wrong line. The generator routes
+  around all of these and reports what it couldn't avoid; a finished set has
+  none left, or only ones you've checked and can justify.
+
 ## The two paths
 
 **Design path** — the user is describing something that doesn't fully exist
@@ -54,15 +90,23 @@ Attach a drill-down **inline** via a `detail` field on the element (a nested
 diagram spec; see `references/spec-format.md`). In the interactive HTML that
 element becomes zoomable — clicking it zooms in-place to the component's
 internals, which stay clickable for their own descriptions, with a
-"← Overview" control to zoom back. A `detail` diagram does not appear in the
-index; it lives inside its parent element. (You can still author a component's
-detail as a separate top-level diagram instead if you want it in the index.)
-This works on **any element of any diagram type**, and the nested diagram can be
-**any of the ten types** — so you can zoom from an ER entity into a class
-diagram, or from a sequence participant into a flowchart — though it's most
-valuable on the container overviews (architecture/component/deployment). Drill-
-down is one level deep. See `references/interview-guide.md` §2.1 for when a
-component earns a drill-down and how to keep it consistent with the overview.
+"← Overview" / "← Back" control to zoom out. A `detail` diagram does not
+appear in the index; it lives inside its parent element. (You can still author
+a component's detail as a separate top-level diagram instead if you want it in
+the index.) Two rules:
+
+- **A drill-down is the same diagram type as its parent** — an architecture
+  box zooms into an architecture diagram, a flowchart step into a flowchart,
+  a class into a class diagram, for all ten types. A mismatch is a hard error.
+  A *different* view of a component (its request flow, its classes) is its
+  own top-level diagram, referenced from the box's description.
+- **Drill-downs are recursive, until atomic.** A box inside a drill-down can
+  carry its own `detail`, to any depth. Keep drilling every box until it can
+  no longer be broken down into smaller components or steps; external
+  systems are always leaves.
+
+See `references/interview-guide.md` §2.1 for when a component earns a
+drill-down and how to keep it consistent with the overview.
 
 ### 2a. Design path: interview
 
@@ -103,6 +147,8 @@ answer** — inspect `analysis.json`, generate and preview the draft spec, then:
   names, real method/route names) so they match the code precisely.
 - Check every `_todo` note the draft spec leaves in state diagrams — these
   mark transitions the analyzer couldn't place with confidence.
+- Look for wrappers/adapters around internal classes and check every call
+  site before drawing them — see `references/reverse-engineering.md` §8.
 
 Full guidance on reading the analyzer's output and turning it into complete
 diagrams is in `references/reverse-engineering.md`.
@@ -115,13 +161,41 @@ table of common mistakes — read it before writing a spec for a diagram type
 you haven't produced yet in this conversation). Use real names from the
 conversation or the codebase, not placeholders.
 
+#### Writing descriptions
+
+Write each `description` as the answer to a newcomer clicking the box and
+asking *"what is this for?"*. Lead with the job, in plain words, from the
+point of view of the system's purpose; keep the code identity on the box's
+`technology` line, where it already shows.
+
+| ✗ Explains the wiring | ✓ Explains the job |
+|---|---|
+| `` `decide()` runs a DSPy `Predict` over `_GrouperSignature` with the JSONAdapter, so the reply is validated against `GrouperOutput`. The model sees the open PUs as a numbered list and answers with an index, never a pu_id. `` | Asks the AI once where the new turn belongs: does it continue one of the person's open problems, start a new one, or end one and start another? |
+| `` `assemble_turns_from_docs` groups spans by `traceId`, finds AGENT root spans, pulls text from their children and resolves `user_id`. `` | Puts the pieces of each conversation back together into turns: who asked, what they asked, what the assistant answered, and when. |
+| `` `_enforce_cap` keeps at most `max_open_pus_per_user` (5) open PUs and evicts the oldest by `last_ts`. `` | Keeps each person to at most five open problems by closing the oldest ones. |
+
+Checks before you generate:
+- Could someone who has never read the code understand it? Domain terms are
+  fine if the diagram's `glossary` defines them.
+- Does the first sentence say what the component *does* (a verb about its
+  job), not which function it calls?
+- Is anything left that only matters to someone editing that function
+  (parameter names, internal types, call order)? Move it to `technology` or
+  `key_points`, or drop it.
+- For a non-obvious component, is there one sentence on why it exists (what
+  would break without it)?
+
+Docstrings copied in by `analyze_code.py` are a starting point only — they
+usually describe the implementation. Rewrite them in these terms; elements
+with no docstring are marked `_todo_description` in the draft spec.
+
 ### 4. Generate
 
 ```bash
 python scripts/generate_diagrams.py spec.json --out-dir out/
 ```
 
-Writes one self-contained, interactive `NN-<type>-<slug>.html` file per
+Writes one self-contained, interactive `NN-<slug>-<type>-diagram.html` file per
 diagram plus an `out/index.html` linking them all. Each HTML file is
 **dependency-free** (all CSS/JS inline — no CDN, no network): the diagram is
 drawn with HTML/CSS boxes over a thin SVG connector layer, and **clicking any
@@ -132,28 +206,57 @@ stderr, that diagram is drawn without the bad reference); real spec errors
 (duplicate ids, missing required fields) fail that one diagram and are also
 printed — fix and rerun. `--only sequence,er` limits which diagram types get
 rendered, useful while iterating on one. `--index path.html` sets the index
-location.
+location. `--draft` lets the run succeed while some descriptions are still
+missing — use it only for early iterations.
 
 ### 5. Validate
 
-The generator runs a structural self-check as it builds each page (dangling
-edges, zero-size shapes) and reports them as warnings — no separate step
-needed. This catches generator bugs, not layout quality — so always look at the
-result (Step 6) too.
+The generator runs a self-check as it builds each page and every drill-down
+layer: dangling edges and zero-size shapes are warnings; a `detail` whose type
+differs from its parent's is a hard error (exit 1). Descriptions are checked
+on every clickable box:
+- **`missing description`** — fails the run (exit 1) unless `--draft` is
+  passed. A set is not finished while any remain.
+- **`weak description`** — a warning: the text starts with a code name, is
+  mostly identifiers, walks through function calls, is over ~320 characters,
+  or only repeats the label. Rewrite it to say the job (see "Writing
+  descriptions"). These are heuristics: if a flagged text genuinely reads well
+  to a newcomer (say, an external endpoint whose job *is* its address), leave
+  it, but look at each one.
 
-Edge routes are **baked into the output itself** — `Page.route_edge` computes
-explicit orthogonal waypoints plus exit/entry anchors for every
-architecture/component/deployment connector, and the HTML emitter draws those
-exact waypoints as the SVG connector layer. So a connector never crosses an
-unrelated box, and the file you hand the user carries its own routing — it
-doesn't depend on any viewer to re-derive a clean path.
+Connectors are checked on the exact lines the HTML draws (every type except
+sequence, where messages crossing lifelines is the notation):
+- **`connectors cross`** — two lines intersect away from their boxes.
+- **`connector … runs through`** — a line passes over a box that isn't one of
+  its ends (lanes, pools, groups and other containers don't count).
+- **`connectors share a line`** — two unrelated lines run on top of each
+  other, so nobody can tell which one continues where.
+- **`label … covers` / `labels overlap`** — an edge label sits on a box or on
+  another label.
+
+These are warnings, summarised as "N misleading connector(s)". Treat each as
+unfinished work: fix it in the spec (Step 6, "Fixing misleading
+connectors"), and only leave one that is genuinely unavoidable and still easy
+to read.
+
+Edge routes are **baked into the output itself**. Every connector in every
+type except sequence gets explicit orthogonal waypoints from the router,
+which (1) never passes through an unrelated box, (2) spreads the connectors
+that meet one side of a box along that side, ordered by where their other
+ends are, so they fan out instead of crossing, (3) charges heavily for
+crossing or riding on a connector already placed and detours where it can,
+and (4) re-routes each connector once more against all the others. Edge
+labels are then placed on their own line where they clear every box and
+label, and the gap between ranks grows to fit the longest label. The file
+you hand the user carries its routing — it doesn't depend on any viewer to
+re-derive a clean path.
 
 ### 6. Look at it
 
 Open the generated `.html` in a browser (or render it headlessly) and **click a
 few boxes** to confirm the side panel shows the right name and description.
-Check for: overlapping shapes, connectors crossing boxes, clipped or missing
-text, lopsided layout. If something looks wrong, it's almost always the spec
+Check for: overlapping shapes, connectors crossing boxes or each other,
+clipped or missing text, lopsided layout. If something looks wrong, it's almost always the spec
 (wrong `direction`, missing `lane`, a fragment index off by one) rather than
 the generator — check `references/spec-format.md`'s mistake table first.
 
@@ -167,6 +270,51 @@ different fixes:
 - *Boxes or labels crowding each other* = a **layout/spacing** problem.
   Tightening or loosening gaps does nothing for an edge routed *through* a
   node — don't reach for spacing when the real issue is routing.
+
+**Fixing misleading connectors.** When the router can't clear a crossing,
+the diagram is asking for too much in one view; spacing won't help. In rough
+order of preference:
+- **Split it.** More than ~12 connectors in one view, or one box with lines
+  to most others, means it should be an overview plus drill-downs (or two
+  diagrams by concern: read path / write path).
+- **Fold fan-in into a group.** Five modules that all depend on one library
+  become one group with one line to the library, or the library goes in a
+  `key_points` entry instead of being drawn.
+- **Drop edges a reader doesn't need.** Transitive or obvious dependencies
+  (everything uses config, everything logs) add crossings and say nothing.
+- **Reorder.** Element order in the spec seeds the layout: put things that
+  talk to each other next to each other; for use-case diagrams, order actors
+  and use cases so each actor's use cases sit beside it.
+- **Change `direction`** (`LR` ↔ `TB`) or move a node into the `lane` /
+  group it actually belongs to.
+- **Shorten edge labels** that cover boxes; long ones belong in the
+  description or `key_points`.
+
+Regenerate after each change and stop when the summary line is gone.
+
+**Then read it as a newcomer, without clicking anything.** Ask:
+- Are there two boxes that look interchangeable (similar names, same kind)?
+- Is there an edge whose meaning isn't obvious?
+- Is there a component someone would ask "why does this exist?" about?
+- Do some components reach the same dependency by different routes, and is
+  that difference shown and explained?
+
+Each hit needs a *visible* fix — a stereotype, a technology line, an edge
+label, a `key_points` entry — not just a description behind a click. Wrappers
+and adapters are the usual culprit; see `references/reverse-engineering.md` §8.
+
+### 6b. Coverage loop — keep going until the project is covered
+
+For "document this project" / onboarding requests, one good pass is not the
+finish line. After each round, walk the coverage checklist in
+`references/interview-guide.md` §2.2 (entry points, modules, external
+systems, data stores, read and write flows, decision logic, lifecycles, core
+types, failure paths, config/auth, observability, deployment), and check that
+every box at every level either has a drill-down or is atomic (can't be
+broken into smaller components or steps). Add the missing diagrams and drill-downs, regenerate, and check
+again. Stop when every row is covered or explicitly not applicable, then tell
+the user what's covered, what you left out and why, and what the code
+couldn't tell you.
 
 ### 7. Deliver and iterate
 

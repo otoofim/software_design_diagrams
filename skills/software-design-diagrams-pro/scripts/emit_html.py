@@ -121,7 +121,11 @@ def _box_divs(page, ox=0.0, oy=0.0, detail_ids=None):
     (containers before leaves) so nesting reads correctly. Boxes whose spec id
     is in `detail_ids` are marked zoomable (clicking them opens a drill-down
     overlay instead of the description panel)."""
+    # detail_ids: a set of zoomable spec ids, or a {spec_id: layer_key} map
+    # when the layer keys differ from the ids (nested drill-downs).
     detail_ids = detail_ids or set()
+    if not isinstance(detail_ids, dict):
+        detail_ids = {str(k): str(k) for k in detail_ids}
     cell_by_id = {c.id: c for c in page.cells}
     depth_cache: dict = {}
     verts = []
@@ -189,7 +193,7 @@ def _box_divs(page, ox=0.0, oy=0.0, detail_ids=None):
             f'data-align="{align}"',
         ]
         if has_detail:
-            attrs.append(f'data-detail="{esc_attr(spec_id)}"')
+            attrs.append(f'data-detail="{esc_attr(detail_ids[str(spec_id)])}"')
         if meta:
             attrs += ['tabindex="0"', 'role="button"']
             title = plain(meta.get("title") or "")
@@ -247,9 +251,71 @@ def _longest_segment_mid(path):
     return ((best[0][0] + best[1][0]) / 2, (best[0][1] + best[1][1]) / 2)
 
 
+_LABEL_FONT_PX = 11
+_LABEL_CHAR_W = 6.2  # matches .edge-label: 11px sans
+
+
+def _label_rect(text, x, y):
+    lines = text.splitlines() or [""]
+    w = max(len(t) for t in lines) * _LABEL_CHAR_W + 8
+    h = 16 * len(lines)
+    return (x - w / 2, y - h / 2, w, h)
+
+
+def _rects_hit(a, b, slack=1.0):
+    return (a[0] < b[0] + b[2] - slack and b[0] < a[0] + a[2] - slack and
+            a[1] < b[1] + b[3] - slack and b[1] < a[1] + a[3] - slack)
+
+
+def place_edge_labels(page):
+    """Choose a spot for every edge label: on its own connector, clear of
+    every box and of labels already placed. Candidates are tried from the
+    middle of the longest segment outwards, so a label stays near the centre
+    of its line when it can. Returns {edge id: (x, y, text, rect)}; the
+    layout check reports any label that found no clear spot."""
+    boxes = [page.abs[c.id] for c in page.cells
+             if c.is_vertex and not c.relative and c.id in page.abs]
+    leaves = [b for b in boxes if not any(o is not b and _contains(b, o) for o in boxes)]
+    placed, out = [], {}
+    for c in page.cells:
+        if not c.is_edge:
+            continue
+        text = plain(c.value)
+        if not text:
+            continue
+        path, _st = _edge_geo(page, c)
+        if not path:
+            continue
+        segs = sorted(zip(path, path[1:]),
+                      key=lambda ab: -(abs(ab[0][0] - ab[1][0]) + abs(ab[0][1] - ab[1][1])))
+        cands = []
+        for a, b in segs:
+            for f in (0.5, 0.35, 0.65, 0.25, 0.75):
+                cands.append((a[0] + (b[0] - a[0]) * f, a[1] + (b[1] - a[1]) * f))
+        best = None
+        for x, y in cands:
+            r = _label_rect(text, x, y)
+            if not any(_rects_hit(r, b) for b in leaves) and not any(_rects_hit(r, q) for q in placed):
+                best = (x, y, r)
+                break
+        if best is None:
+            x, y = _longest_segment_mid(path)
+            best = (x, y, _label_rect(text, x, y))
+        placed.append(best[2])
+        out[c.id] = (best[0], best[1], text, best[2])
+    return out
+
+
+def _contains(outer, inner, pad=0.5):
+    return (outer[0] - pad <= inner[0] and outer[1] - pad <= inner[1] and
+            inner[0] + inner[2] <= outer[0] + outer[2] + pad and
+            inner[1] + inner[3] <= outer[1] + outer[3] + pad)
+
+
 def _edges_svg_and_labels(page, ox=0.0, oy=0.0):
     """Return (list of svg element strings, list of label div strings)."""
     svg_parts, labels = [], []
+    label_at = place_edge_labels(page)
     for c in page.cells:
         if not c.is_edge:
             continue
@@ -265,9 +331,8 @@ def _edges_svg_and_labels(page, ox=0.0, oy=0.0):
         start_marker = ' marker-start="url(#arrow)"' if st.get("startArrow") not in (None, "none") else ""
         pts = " ".join(f"{p[0] + ox:.1f},{p[1] + oy:.1f}" for p in path)
         svg_parts.append(f'<polyline points="{pts}"{dashed}{marker}{start_marker} fill="none"/>')
-        lbl = plain(c.value)
-        if lbl:
-            mx, my = _longest_segment_mid(path)
+        if c.id in label_at:
+            mx, my, lbl, _r = label_at[c.id]
             labels.append(
                 f'<div class="edge-label" style="left:{mx + ox:.0f}px;top:{my + oy:.0f}px">'
                 f'{html.escape(lbl)}</div>')
@@ -317,6 +382,16 @@ body{background:var(--bg);color:var(--ink);font-family:var(--font);font-size:13p
   color:var(--accent);background:var(--bg);white-space:nowrap}
 .home-link:hover{border-color:var(--accent)}
 .stage{position:relative;overflow:auto;height:calc(100vh - 42px)}
+.intro{margin:20px 24px 0;max-width:1100px;background:var(--panel);border:1px solid var(--panel-border);
+  border-radius:8px;padding:14px 18px;box-shadow:var(--shadow);line-height:1.55;font-size:13.5px}
+.intro summary{cursor:pointer;font-weight:600;font-size:14px;color:var(--accent)}
+.intro p{margin:8px 0}
+.intro h3{font-size:12px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);margin:14px 0 4px}
+.intro ol,.intro ul{margin:4px 0;padding-left:22px}
+.intro li{margin:3px 0}
+.intro code{background:var(--bg);border:1px solid var(--panel-border);border-radius:3px;padding:0 3px;font-size:12px}
+.intro dl{display:grid;grid-template-columns:max-content 1fr;gap:4px 14px;margin:4px 0}
+.intro dt{font-weight:600}.intro dd{margin:0}
 .canvas{position:relative;margin:24px;background:var(--canvas)}
 .edges{position:absolute;left:0;top:0;overflow:visible;pointer-events:none;z-index:0}
 .edge{stroke:var(--edge);stroke-width:1.4;stroke-linejoin:round;stroke-linecap:round}
@@ -328,6 +403,9 @@ body{background:var(--bg);color:var(--ink);font-family:var(--font);font-size:13p
   color:#0f172a;border-radius:4px;overflow:hidden;font-size:12px;line-height:1.35;
   display:flex;align-items:center;justify-content:center;text-align:center}
 .box .box-label{padding:4px 6px;width:100%;overflow:hidden}
+.box[data-label-pos="bottom"]{overflow:visible;border-radius:50% 50% 4px 4px}
+.box[data-label-pos="bottom"] .box-label{position:absolute;top:100%;left:50%;transform:translateX(-50%);
+  width:max-content;max-width:160px;padding-top:4px;font-weight:600}
 .box[data-label-pos="top"]{align-items:flex-start}
 .box[data-label-pos="top"] .box-label{text-align:inherit}
 .box[data-align="left"] .box-label{text-align:left}
@@ -339,7 +417,7 @@ body{background:var(--bg);color:var(--ink);font-family:var(--font);font-size:13p
   border:1.4px solid var(--stroke);transform:rotate(45deg) scale(.72)}
 .box.shape-rhombus .box-label{position:relative;z-index:1}
 .box.shape-cylinder{border-radius:50%/14px}
-.box.shape-note{border-radius:0}
+.box.shape-note{border-radius:0;z-index:30!important}
 .box.clickable{cursor:pointer}
 .box.clickable:hover{box-shadow:var(--shadow);filter:brightness(1.02)}
 .box.clickable:focus-visible,.box.selected{outline:2px solid var(--accent);outline-offset:1px}
@@ -506,6 +584,39 @@ def _canvas_block(page, detail_ids=None):
     return canvas, _panel_payload(page)
 
 
+def _inline(text):
+    """Escape, then turn `code` spans into <code>."""
+    out = re.sub(r"`([^`]+)`", r"<code>\1</code>", html.escape(str(text)))
+    out = re.sub(r"\*\*([^*]+)\*\*", r"<b>\1</b>", out)
+    return re.sub(r"(?<![\w*])\*([^*\s][^*]*?)\*(?![\w*])", r"<i>\1</i>", out)
+
+
+def render_intro(intro, heading="About this diagram"):
+    """Visible explanation shown above a diagram (summary / how to read / key
+    points / glossary). `intro` is a dict taken from the diagram spec; returns ''
+    when it carries nothing."""
+    if not intro:
+        return ""
+    parts = []
+    for para in ([intro["summary"]] if isinstance(intro.get("summary"), str) else intro.get("summary") or []):
+        parts.append(f"<p>{_inline(para)}</p>")
+    for key, section, tag in (("how_to_read", "How to read this diagram", "ul"),
+                              ("steps", "Step by step", "ol"),
+                              ("key_points", "Things worth knowing", "ul")):
+        items = intro.get(key) or []
+        if items:
+            lis = "".join(f"<li>{_inline(i)}</li>" for i in items)
+            parts.append(f"<h3>{section}</h3><{tag}>{lis}</{tag}>")
+    gl = intro.get("glossary") or {}
+    if gl:
+        rows = "".join(f"<dt>{_inline(k)}</dt><dd>{_inline(v)}</dd>" for k, v in gl.items())
+        parts.append(f"<h3>Terms used here</h3><dl>{rows}</dl>")
+    if not parts:
+        return ""
+    return (f'<details class="intro" open><summary>{html.escape(heading)} (click to collapse)</summary>'
+            + "".join(parts) + "</details>")
+
+
 def render_page_html(page, title=None, details=None, index_href=None):
     """Full standalone HTML document string for one Page.
 
@@ -518,7 +629,9 @@ def render_page_html(page, title=None, details=None, index_href=None):
     subcomponents), which stay clickable for their own descriptions.
     """
     details = details or {}
-    detail_ids = set(details)
+    # top-level zoomables are the keys without a path separator; a nested key
+    # "a/b" is zoomable from inside layer "a" (box spec id "b").
+    detail_ids = {k: k for k in details if "/" not in k}
     canvas, payload = _canvas_block(page, detail_ids)
     name = html.escape(title or page.name or "Diagram")
     hint = ("Click a component to see its description"
@@ -529,13 +642,15 @@ def render_page_html(page, title=None, details=None, index_href=None):
     # one detail layer per zoomable component; hidden until its box is clicked
     detail_blocks, detail_payload = [], {}
     for sid, (dtitle, dpage) in details.items():
-        dcanvas, dmeta = _canvas_block(dpage, set())
+        children = {k.rsplit("/", 1)[1]: k for k in details
+                    if "/" in k and k.rsplit("/", 1)[0] == str(sid)}
+        dcanvas, dmeta = _canvas_block(dpage, children)
         detail_payload[str(sid)] = dmeta
         detail_blocks.append(
             f'<section class="zoom-layer" data-detail-id="{esc_attr(sid)}" hidden>'
-            f'<div class="zoom-head"><button class="zoom-back" type="button">← Overview</button>'
+            f'<div class="zoom-head"><button class="zoom-back" type="button">{"← Back" if "/" in str(sid) else "← Overview"}</button>'
             f'<h2>{html.escape(dtitle)}</h2></div>'
-            f'<div class="stage zoom-stage">{dcanvas}</div></section>')
+            f'<div class="stage zoom-stage">{render_intro(getattr(dpage, "intro", None))}{dcanvas}</div></section>')
 
     # Escape '<' so any "</script>" in the data can't break out of the blob.
     meta_json = json.dumps({"main": payload, "details": detail_payload},
@@ -556,6 +671,7 @@ def render_page_html(page, title=None, details=None, index_href=None):
   <span class="hint">{hint}</span>
 </div>
 <div class="stage" id="main-stage">
+  {render_intro(getattr(page, "intro", None))}
   {canvas}
 </div>
 {"".join(detail_blocks)}
@@ -573,12 +689,14 @@ def write_html(page, path, title=None, details=None, index_href=None):
     return path
 
 
-def write_index(entries, path, title="Diagrams"):
+def write_index(entries, path, title="Diagrams", intro=None):
     """entries: list of (display_name, filename). Writes a simple, dependency-free
     index page linking every diagram."""
     items = "\n".join(
-        f'    <li><a href="{esc_attr(fn)}">{html.escape(nm)}</a></li>'
-        for nm, fn in entries)
+        f'    <li><a href="{esc_attr(e[1])}"><b>{html.escape(e[0])}</b>'
+        + (f'<span class="blurb">{_inline(e[2])}</span>' if len(e) > 2 and e[2] else "")
+        + '</a></li>'
+        for e in entries)
     doc = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -593,11 +711,14 @@ def write_index(entries, path, title="Diagrams"):
   border:1px solid var(--panel-border);border-radius:8px;color:var(--ink);
   text-decoration:none;font-size:15px;box-shadow:var(--shadow)}}
 .index a:hover{{border-color:var(--accent);color:var(--accent)}}
+.index .blurb{{display:block;color:var(--muted);font-size:13px;margin-top:4px;line-height:1.5}}
+.index .intro{{margin:0 0 16px}}
 </style>
 </head>
 <body>
 <div class="index">
   <h1>{html.escape(title)}</h1>
+  {render_intro(intro, "About this guide")}
   <ul>
 {items}
   </ul>

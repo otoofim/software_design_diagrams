@@ -10,6 +10,7 @@ follow-up question ("Is this right? What's missing?").
 1. [How to run the interview](#1-how-to-run-the-interview)
 2. [Choosing which diagrams to produce](#2-choosing-which-diagrams-to-produce)
    - [2.1 Drill-down diagrams for big components](#21-drill-down-diagrams-for-big-components)
+   - [2.2 Coverage: keep going until the whole project is covered](#22-coverage-keep-going-until-the-whole-project-is-covered)
 3. [Round 1: system context (always)](#3-round-1-system-context)
 4. [Per-diagram question bank](#4-per-diagram-question-bank)
 5. [Consistency checks across diagrams](#5-consistency-checks-across-diagrams)
@@ -114,10 +115,12 @@ Keep the set consistent:
   up, and it's also what `references/spec-format.md`'s cross-diagram id
   convention already recommends.
 - Name the drill-down diagrams so they sort next to the overview and are
-  self-explanatory in a file listing, e.g. `"name": "Payment service —
-  detail"` next to `"name": "System overview"` (the generator slugs these
-  into `01-architecture-system-overview.html`,
-  `02-architecture-payment-service-detail.html`, …).
+  self-explanatory in a file listing, and end every name with its diagram
+  type, e.g. `"name": "Payment service — Architecture diagram"` next to
+  `"name": "System overview — Architecture diagram"` (the generator slugs
+  these into `01-system-overview-architecture-diagram.html`,
+  `02-payment-service-architecture-diagram.html`, …; it appends the type if
+  you forget).
 - Mention in the overview box's label or a short note that a detail diagram
   exists for it, so someone skimming just the overview knows to look further.
 
@@ -129,12 +132,62 @@ one map of the whole, one map per big piece.
 
 The guidance above is written around architecture/component/deployment because
 that's where drill-downs pay off most, but the inline `detail` field works on
-**any element of any diagram type**, and the nested diagram can be any of the
-ten types (see `references/spec-format.md`). So the same judgement applies more
-broadly — e.g. a flowchart step whose expansion is its own sub-flow, an ER
-entity you want to open as a class diagram, or a sequence participant you want
-to open as a flowchart. Use it wherever a single node hides a worthwhile second
-layer; don't manufacture one where the node is genuinely atomic.
+**any element of any diagram type** — with one rule: **the drill-down is the
+same type as its parent** (architecture → architecture, flowchart →
+flowchart, class → class, …; see `references/spec-format.md`). A flowchart
+step whose expansion is its own sub-flow is a natural inline drill-down. A
+*different* view of the same thing — the request flow through an architecture
+box, the classes behind an ER entity — is a separate top-level diagram; name
+it in the box's `description` so the reader can find it.
+
+**Drill-downs are recursive, all the way down.** Every box that can still be
+broken into smaller components or steps gets its own `detail`, and every box
+inside that detail is checked the same way. Keep zooming until each leaf is
+**atomic**: it can no longer be broken down into smaller parts of the
+diagram's kind. For example:
+
+| Diagram type | A leaf is atomic when it is… |
+|---|---|
+| architecture / component / deployment | a single unit with no internal parts worth naming separately (one class, one function, one table, one external system, one container with one process) |
+| flowchart / activity | a single action with no sub-steps or branches of its own |
+| sequence | a participant whose handling of the message is one call with no further collaborators |
+| state | a simple state with no sub-states |
+| class / er / usecase | a class, table or use case with no meaningful parts of the same kind inside it |
+
+External systems are atomic by definition: draw them as one box and don't
+model their internals. When in doubt, go one level deeper. A drill-down with
+only two boxes is fine if those really are the parts.
+
+Don't manufacture structure: if a node really is atomic, leave it as a leaf.
+
+### 2.2 Coverage: keep going until the whole project is covered
+
+For a "document this project" / onboarding request, the job isn't done when
+the first few diagrams look good — it's done when a newcomer could answer
+every question on this checklist from the diagram set alone. Work in rounds:
+draw, check the list, add diagrams or drill-downs for whatever is missing,
+regenerate, check again.
+
+| Aspect | Usually covered by |
+|---|---|
+| What the project does, for whom, and what it talks to | overview `architecture` + `usecase` |
+| Every deployable unit / entry point (CLI, service, job, worker, UI) | `architecture` + its drill-downs |
+| Every major package/module and how they depend on each other | `component` (+ drill-downs) |
+| Every external system and the protocol to it | `architecture` / `component` |
+| Every data store, its schema, and who reads/writes it | `er` + edges on `architecture` |
+| Every main flow end-to-end, read *and* write paths | `sequence` per flow |
+| Branching rules / decision logic that matter | `flowchart` / `activity` |
+| Every entity with a lifecycle | `state` |
+| Core domain types and abstractions (incl. adapters/wrappers) | `class` |
+| Failure, retry and fallback paths | `flowchart`/`sequence` alt fragments, `key_points` |
+| Configuration, auth/secrets, scheduling | `deployment` + descriptions |
+| Observability (logs, traces, metrics) where it shapes the design | `architecture`/`component` |
+| Where things run | `deployment` |
+
+Every box at every level, not just in the overviews, either has a
+drill-down or is atomic (see §2.1). Every row is either covered or explicitly marked not applicable.
+Finish by telling the user what is covered, what you deliberately left out
+and why, and what you couldn't determine from the code.
 
 ---
 
@@ -242,6 +295,9 @@ Before delivering a set, make sure the diagrams agree with each other:
 - Use cases map to at least one sequence or activity diagram when both are
   produced.
 - Deployment artifacts correspond to components/services.
+- Path consistency: when several components reach the same dependency, they
+  either take the same route in every diagram, or the diagrams show the
+  different routes and say why (or that the reason is historical/unrecorded).
 
 Shared ids across diagrams (e.g. `api`, `orders_db`) make this easy to check.
 

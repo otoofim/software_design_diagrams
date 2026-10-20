@@ -1214,6 +1214,42 @@ def _name_variants(name):
     return list(dict.fromkeys(out))
 
 
+#: keys under which each diagram type keeps its clickable elements
+_ELEMENT_KEYS = ("elements", "nodes", "classes", "entities", "states",
+                 "participants", "use_cases", "actors")
+#: pseudo-states and control nodes that are not clickable and need no description
+_SILENT_KINDS = {"initial", "final", "fork", "join", "merge", "choice",
+                 "history", "deep_history", "flow_final"}
+
+
+def mark_missing_descriptions(spec):
+    """Flag every draft element that has no `description` (no docstring was
+    found) with a `_todo_description` note, so the gaps are visible in the spec
+    instead of surfacing only as generator warnings. Returns how many were
+    flagged. Docstrings that *were* copied in still need a read: they often say
+    how the code works rather than what job the component does."""
+    count = 0
+
+    def walk(els):
+        nonlocal count
+        for el in els or []:
+            if not isinstance(el, dict):
+                continue
+            if not el.get("description") and el.get("kind") not in _SILENT_KINDS:
+                el["_todo_description"] = ("say in plain words what job this component "
+                                           "does (and, if not obvious, why it exists)")
+                count += 1
+            walk(el.get("children"))
+            if isinstance(el.get("detail"), dict):
+                for k in _ELEMENT_KEYS:
+                    walk(el["detail"].get(k))
+
+    for d in spec.get("diagrams", []):
+        for k in _ELEMENT_KEYS:
+            walk(d.get(k))
+    return count
+
+
 def draft_spec(a, max_classes=30, depth=1):
     diagrams = []
     classes = a["classes"]
@@ -1502,8 +1538,14 @@ def main():
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump(analysis, fh, indent=1, default=list)
     if args.draft_spec:
+        spec = draft_spec(analysis, args.max_classes, args.depth)
+        todo = mark_missing_descriptions(spec)
         with open(args.draft_spec, "w", encoding="utf-8") as fh:
-            json.dump(draft_spec(analysis, args.max_classes, args.depth), fh, indent=1)
+            json.dump(spec, fh, indent=1)
+        if todo:
+            print(f"draft spec: {todo} element(s) have no docstring to describe them; each is "
+                  "marked with \"_todo_description\". Write its job in plain words before "
+                  "generating.", file=sys.stderr)
     s = analysis["summary"]
     print(json.dumps({"languages": analysis["languages"], **s,
                       "routes_sample": [f"{r['method']} {r['path']} -> {r['handler']}"

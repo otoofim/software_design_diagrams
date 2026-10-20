@@ -17,6 +17,7 @@ file it cites.
 5. [Trimming large repos](#5-trimming-large-repos)
 6. [Language and framework coverage](#6-language-and-framework-coverage)
 7. [When something looks wrong](#7-when-something-looks-wrong)
+8. [Wrappers, adapters and layered clients](#8-wrappers-adapters-and-layered-clients)
 
 ---
 
@@ -82,6 +83,11 @@ mentions it — you'll get the exact file/line to go verify behaviour in.
   ORM-declared FKs/relationships; cardinality guesses `0..1` on the FK side
   when the column is nullable, `1` otherwise, and `to_card` is `0..*` unless
   the relation was explicitly one-to-one.
+- **descriptions** — every element gets its docstring / doc-comment as its
+  `description` where one exists; elements without one are marked
+  `_todo_description`. Treat both as drafts: docstrings mostly explain the
+  implementation, while a diagram description must say the component's job
+  in plain words (see SKILL.md "Writing descriptions").
 - **component** — one diagram of internal module dependencies, collapsed to
   `--depth` path segments, wrapped in a subsystem box named after the repo
   root, plus a leaf per external integration actually used by some module.
@@ -175,3 +181,35 @@ show up, check the file directly rather than assuming the model is wrong.
   analyzer doesn't resolve will under-count edges; this is common enough
   that it's worth spot-checking a couple of `module_dependencies` entries
   against the actual imports before trusting the component diagram fully.
+
+## 8. Wrappers, adapters and layered clients
+
+The most common "why do we need both?" question a newcomer asks about a
+diagram is about two boxes with similar names where one wraps the other — an
+HTTP client and a framework adapter around it, a repository and a caching
+decorator, an SDK client and the project's own facade. Drawn as peers, they
+look redundant. Drawn properly, they explain a design decision.
+
+**Spot them.** A class that subclasses a *third-party* base (a framework's
+`BaseLM`, `Session`, `Transport`, `Handler`, `Backend`, …) whose main method
+mostly reshapes its arguments and calls one *internal* class is an adapter.
+In `analysis.json`: an external name in `bases`, few methods, and a
+`module_dependencies` edge to the module of the class it wraps.
+
+**Check every call site.** Before drawing, grep for who uses the wrapper and
+who calls the inner class directly. If some callers bypass the wrapper, that
+asymmetry is usually the most important fact on the diagram — draw both
+paths.
+
+**Find the reason it exists**, in this order: the module/class docstring; the
+commit or PR that introduced it (`git log --follow -- <file>`, then the PR or
+issue it references); the issue tracker. Write that reason into the box's
+`description` ("without it, framework X would call the API directly and skip
+our tracing"). If nothing records a reason — e.g. one caller was simply never
+migrated — say so ("predates X; not migrated") rather than inventing a
+plausible-sounding one.
+
+**Draw it as a wrapper**, not a peer: `stereotype: "adapter"` (or
+`decorator`/`facade`), `technology` naming what it adapts, a labelled
+`delegates to` edge to the inner class, and the inner class's description
+stating that it is the single place that does the real work.
